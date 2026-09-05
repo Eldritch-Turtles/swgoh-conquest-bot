@@ -1,6 +1,16 @@
-mss==9.0.1
-opencv-python==4.8.1.78
-pytesseract==0.3.10
-pillow==10.0.1
-numpy==1.24.3
-pydantic==2.3.0
+# --- core: seeing the game -------------------------------------------------
+numpy>=1.26
+opencv-python>=4.10      # full build; `learn` uses its GUI for interactive cropping
+mss>=9.0                 # screenshots the game window
+pillow>=10.0
+
+# --- dev -------------------------------------------------------------------
+pytest>=8.0
+
+# --- text reading (step 3+, not used yet) ----------------------------------
+# Needs the Tesseract program installed separately, not just this package.
+pytesseract>=0.3.10
+
+# --- optional --------------------------------------------------------------
+# Captures the game window even when it is behind other windows. Windows only.
+# windows-capture>=1.4

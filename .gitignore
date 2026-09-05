@@ -1,0 +1,11 @@
+# Debug captures. These pile up fast and may show your account name.
+data/captures/
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+env/
+.vscode/
+.idea/
