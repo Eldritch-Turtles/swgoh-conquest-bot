@@ -21,7 +21,7 @@ everywhere needs a burst (`learn --burst 5`) so the motion gets masked out.
 | 3 | `home` | The hub. Heavily animated background. | ☐ |
 | 4 | `conquest_lobby` | Conquest intro — crate tier, Normal/Hard, enter button. | ☐ |
 | 5 | `difficulty_select` | Normal vs Hard. May be folded into the lobby. | ☐ |
-| 6 | `sector_map` | The node graph for the current sector. Scrollable. | ☐ |
+| 6 | `sector_map` | The node graph. **Scrolls left/right** — see below. | ☐ |
 | 7 | `node_preview` | Tapping a node: modifiers, enemy preview, Battle button. | ☐ |
 | 8 | `squad_select` | Unit picker with stamina values. The important one. | ☐ |
 | 9 | `disk_prompt` | Data disk / consumable offer. Appears conditionally. | ☐ |
@@ -47,21 +47,50 @@ rather than assuming the happy path.
 | `conquest_ended` | Conquest is not live — nothing to do. | ☐ |
 | `generic_popup` | Catch-all. Anything with a close button. | ☐ |
 
-## Workflow per screen
+## Workflow: a normal screen
 
 ```powershell
 # 1. Capture a burst so animation is visible
-python -m swgoh_bot.cli grab --label sector_map --burst 5
+python -m swgoh_bot.cli grab --label battle_result --burst 5
 
 # 2. See what holds still, and get a suggested region
-python -m swgoh_bot.cli stability --image data\captures\sector_map-burst-<stamp> --label sector_map
+python -m swgoh_bot.cli stability --image data\captures\battle_result-burst-<stamp> --label battle_result
 
 # 3. Teach it, masking out whatever moves
-python -m swgoh_bot.cli learn sector_map --image data\captures\sector_map-burst-<stamp> --burst 5 --region <from step 2>
+python -m swgoh_bot.cli learn battle_result --image data\captures\battle_result-burst-<stamp> --burst 5 --region <from step 2>
 
 # 4. Confirm nothing leaks into it
 python -m swgoh_bot.cli check
 ```
+
+## Workflow: a screen that scrolls
+
+The sector map is a canvas wider than the window, so the same screen looks
+completely different depending on where you have dragged it. Anchoring on the
+content cannot work. Anchor on the fixed HUD instead.
+
+The only change is that you **drag the map while capturing the burst** — then
+whatever held still is the HUD.
+
+```powershell
+# 1. Capture while dragging steadily left or right
+python -m swgoh_bot.cli grab --label sector_map --burst 8
+
+# 2. Split fixed HUD from scrolling content; get a HUD anchor and the viewport
+python -m swgoh_bot.cli hud --image data\captures\sector_map-burst-<stamp> --label sector_map
+
+# 3. Teach from the HUD, recording the viewport
+python -m swgoh_bot.cli learn sector_map --image data\captures\sector_map-burst-<stamp> --region <from step 2> --viewport <from step 2>
+
+# 4. Optional: reassemble the whole sector into one image
+python -m swgoh_bot.cli scroll-map --image data\captures\sector_map-burst-<stamp> --screen sector_map
+```
+
+Verify by running `identify` at several different scroll positions — it should
+report the same screen with a high score at all of them.
+
+Screens likely to need this treatment: `sector_map` certainly, and probably
+`squad_select` (the unit list scrolls) and `rewards` (long loot lists).
 
 ## Screens that may resist template matching
 

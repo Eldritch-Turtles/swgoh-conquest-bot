@@ -349,6 +349,187 @@ def cmd_stability(args) -> int:
     return 0
 
 
+def _largest_run(flags) -> tuple[int, int] | None:
+    """Longest contiguous run of True values, as (start, length)."""
+    best_start = best_length = 0
+    start = None
+    for index, flag in enumerate(list(flags) + [False]):
+        if flag and start is None:
+            start = index
+        elif not flag and start is not None:
+            if index - start > best_length:
+                best_start, best_length = start, index - start
+            start = None
+    return (best_start, best_length) if best_length else None
+
+
+def cmd_hud(args) -> int:
+    """Separate the fixed HUD from the scrolling content.
+
+    Run this on a burst captured *while dragging the map*. Anything that holds
+    still across a scroll is fixed furniture - header, sector label, energy bar
+    - and that is the only safe place to anchor a scrollable screen's identity.
+    Anything that moved is content, whose position means nothing.
+    """
+    import cv2
+    import numpy as np
+
+    from swgoh_bot.capture import frames_are_identical
+    from swgoh_bot.vision import stability_mask, suggest_anchors
+
+    try:
+        frames = _collect_burst(args, args.burst, args.interval)
+    except ValueError as exc:
+        print(f"error: {exc}")
+        return 1
+
+    print(f"{len(frames)} frames from {frames[0].source}")
+
+    if frames_are_identical(frames):
+        print()
+        print("Nothing moved between these frames, so there is no scroll to")
+        print("analyse. Capture again while dragging the map:")
+        print("    python -m swgoh_bot.cli grab --label sector_map --burst 6")
+        print("Drag steadily during the capture.")
+        return 1
+
+    mask = stability_mask(frames)
+    row_static = mask.mean(axis=1) / 255.0
+
+    moving = row_static < 0.5
+    run = _largest_run(moving)
+    if run is None:
+        print()
+        print("No band of this screen moved. Either the drag did not register,")
+        print("or this screen does not scroll - in which case treat it as a")
+        print("normal screen and use `stability` instead.")
+        return 2
+
+    start, length = run
+    viewport = (0, start, WORK_WIDTH, length)
+
+    print(f"static overall: {100 * mask.mean() / 255:.1f}%")
+    print()
+    print("Bands, top to bottom:")
+    if start > 0:
+        print(f"  y {0:>3}-{start:<3}  FIXED      header / HUD")
+    print(f"  y {start:>3}-{start + length:<3}  SCROLLING  content")
+    if start + length < WORK_HEIGHT:
+        print(f"  y {start + length:>3}-{WORK_HEIGHT:<3}  FIXED      footer / HUD")
+    print()
+    print(f"Suggested viewport: {viewport[0]},{viewport[1]},{viewport[2]},{viewport[3]}")
+
+    # Anchors must come from the fixed bands only.
+    fixed_mask = mask.copy()
+    fixed_mask[start : start + length, :] = 0
+    suggestions = [
+        candidate
+        for candidate in suggest_anchors(
+            frames, count=args.count * 3, size=(args.width, args.height)
+        )
+        if candidate.y + candidate.height <= start or candidate.y >= start + length
+    ][: args.count]
+
+    print()
+    if not suggestions:
+        print("No usable anchor found in the fixed bands. They may be too plain.")
+        print("Open the overlay from `stability` and look for text in the header")
+        print("or footer; pass --width/--height to try a different region size.")
+        return 2
+
+    print("Anchor regions in the FIXED bands, strongest first:")
+    print()
+    for index, candidate in enumerate(suggestions, start=1):
+        band = "header" if candidate.y < start else "footer"
+        print(
+            f"  {index}. region {candidate.cli_region:<20} {band:<7} "
+            f"static {100 * candidate.stable_fraction:.1f}%  "
+            f"detail {candidate.detail:.1f}"
+        )
+
+    name = args.label or "SCREEN_NAME"
+    source = args.image or "data/captures/<your burst folder>"
+    print()
+    print("Teach the screen from the fixed HUD, recording the viewport:")
+    print(
+        f"    python -m swgoh_bot.cli learn {name} --image {source} "
+        f"--region {suggestions[0].cli_region} "
+        f"--viewport {viewport[0]},{viewport[1]},{viewport[2]},{viewport[3]}"
+    )
+    return 0
+
+
+def cmd_scroll_map(args) -> int:
+    """Stitch a dragged sequence into one image of the whole scrollable area.
+
+    Drag the map from one end to the other while capturing a burst, and this
+    reassembles it. Every node is then locatable once, in coordinates that do
+    not shift as the view scrolls.
+    """
+    import cv2
+
+    from swgoh_bot.scroll import measure_shift, stitch
+    from swgoh_bot.vision import ScreenClassifier
+
+    viewport = args.viewport
+    if viewport is None and args.screen:
+        match = [
+            screen
+            for screen in ScreenClassifier.from_directory().screens
+            if screen.name == args.screen
+        ]
+        if not match:
+            print(f"No screen named {args.screen!r}. Run `screens` to list them.")
+            return 1
+        viewport = match[0].viewport
+        if viewport is None:
+            print(f"Screen {args.screen!r} has no viewport recorded.")
+            print("Re-teach it with --viewport, or pass --viewport here.")
+            return 1
+
+    try:
+        frames = _collect_burst(args, args.burst, args.interval)
+    except ValueError as exc:
+        print(f"error: {exc}")
+        return 1
+
+    if viewport is None:
+        print("Warning: no --viewport given, so the fixed HUD will be stitched")
+        print("repeatedly and smear across the result. Run `hud` to find it.")
+        print()
+
+    shifts = [
+        measure_shift(before, after, region=viewport)
+        for before, after in zip(frames, frames[1:])
+    ]
+    weak = [s for s in shifts if not s.trustworthy]
+    total = sum(-s.dx for s in shifts)
+
+    print(f"{len(frames)} frames, {len(shifts)} transitions")
+    print(f"scrolled {total:+.0f} px in total")
+    if weak:
+        print(f"{len(weak)} transition(s) too weak to measure - treated as still")
+    if abs(total) < 20:
+        print()
+        print("Barely any movement detected. Did the drag register during capture?")
+        return 2
+
+    panorama = stitch(frames, region=viewport)
+    CAPTURES_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    label = args.label or "scrollmap"
+    path = CAPTURES_DIR / f"{label}-panorama-{stamp}.png"
+    cv2.imwrite(str(path), panorama.image)
+
+    print(f"panorama {panorama.size[0]}x{panorama.size[1]}")
+    print(f"saved    {path}")
+    print()
+    print("Open it and check the content lines up with no visible seams or")
+    print("repeated chunks. Seams mean the drag was too fast between frames -")
+    print("capture again with more frames or a slower drag.")
+    return 0
+
+
 def cmd_identify(args) -> int:
     """Say which known screen the current frame is."""
     from swgoh_bot.vision import ScreenClassifier
@@ -436,6 +617,7 @@ def cmd_learn(args) -> int:
             description=args.description,
             threshold=args.threshold,
             burst=burst,
+            viewport=args.viewport,
         )
     except ValueError as exc:
         print(f"error: {exc}")
@@ -569,9 +751,19 @@ def cmd_screens(args) -> int:
         print(f"{screen.name}  (threshold {screen.threshold})")
         if screen.description:
             print(f"  {screen.description}")
+        if screen.viewport:
+            x, y, w, h = screen.viewport
+            print(f"  scrolls: viewport {x},{y},{w},{h}")
         for anchor in screen.anchors:
             h, w = anchor.template.shape[:2]
-            print(f"  anchor {anchor.name!r} {w}x{h} region={anchor.region}")
+            masked = " masked" if anchor.mask is not None else ""
+            print(
+                f"  anchor {anchor.name!r} {w}x{h} region={anchor.region}{masked}"
+            )
+        stray = screen.anchors_in_viewport()
+        if stray:
+            names = ", ".join(repr(a.name) for a in stray)
+            print(f"  WARNING: {names} sits in the scrolling area and will drift")
     return 0
 
 
@@ -643,6 +835,33 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--height", type=int, default=80, help="suggested region height")
     p.set_defaults(func=cmd_stability)
 
+    p = sub.add_parser(
+        "hud", help="split a scrollable screen into fixed HUD and content"
+    )
+    add_capture_options(p)
+    p.add_argument("--label", help="screen name, used in the suggested command")
+    p.add_argument("--burst", type=int, default=6, help="frames to compare")
+    p.add_argument("--interval", type=float, default=0.2, help="seconds between frames")
+    p.add_argument("--count", type=int, default=5, help="how many regions to suggest")
+    p.add_argument("--width", type=int, default=220, help="suggested region width")
+    p.add_argument("--height", type=int, default=80, help="suggested region height")
+    p.set_defaults(func=cmd_hud)
+
+    p = sub.add_parser(
+        "scroll-map", help="stitch a dragged sequence into one wide image"
+    )
+    add_capture_options(p)
+    p.add_argument("--label", help="name for the saved panorama")
+    p.add_argument("--burst", type=int, default=12, help="frames to stitch")
+    p.add_argument("--interval", type=float, default=0.3, help="seconds between frames")
+    p.add_argument(
+        "--viewport", type=_parse_region, help="scrolling area 'x,y,w,h'"
+    )
+    p.add_argument(
+        "--screen", help="take the viewport from this already-taught screen"
+    )
+    p.set_defaults(func=cmd_scroll_map)
+
     p = sub.add_parser("identify", help="say which screen is showing")
     add_capture_options(p)
     p.add_argument("-v", "--verbose", action="store_true", help="show every score")
@@ -667,6 +886,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--interval", type=float, default=0.2, help="seconds between burst frames"
+    )
+    p.add_argument(
+        "--viewport",
+        type=_parse_region,
+        help="scrolling area 'x,y,w,h' on this screen; anchors must sit outside it",
     )
     p.set_defaults(func=cmd_learn)
 

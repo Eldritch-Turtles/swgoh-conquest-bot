@@ -83,10 +83,16 @@ def anchor_is_degenerate(template: np.ndarray) -> bool:
     return float(np.std(template)) < MIN_ANCHOR_STDDEV
 
 
-def _as_gray(frame) -> np.ndarray:
-    """Accept a Frame or an array; return working-size grayscale."""
+def _as_gray(frame, normalize: bool = True) -> np.ndarray:
+    """Accept a Frame or an array; return grayscale.
+
+    `normalize` rescales to the canonical working resolution, which is right
+    for a captured game frame. Turn it off for an image that is not a screen -
+    a stitched panorama of a scrolling map, most importantly, which is far
+    wider than a screen and would be mangled by the rescale.
+    """
     image = frame.image if isinstance(frame, Frame) else frame
-    work = to_working_size(image)
+    work = to_working_size(image) if normalize else image
     if work.ndim == 2:
         return work
     return cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
@@ -276,12 +282,41 @@ class AnchorMatch:
 
 @dataclass(frozen=True)
 class ScreenDefinition:
-    """One recognisable game screen."""
+    """One recognisable game screen.
+
+    `viewport` marks the scrolling area, if the screen has one. Everything
+    outside it is fixed HUD, which is where identity anchors belong - content
+    inside the viewport moves when the player drags, so it cannot identify
+    anything. The viewport is also the region to search with find_all and to
+    measure scroll against.
+    """
 
     name: str
     anchors: tuple[Anchor, ...]
     threshold: float = DEFAULT_THRESHOLD
     description: str = ""
+    viewport: Region | None = None
+
+    @property
+    def scrollable(self) -> bool:
+        return self.viewport is not None
+
+    def anchors_in_viewport(self) -> tuple[Anchor, ...]:
+        """Anchors that sit inside the scrolling area - i.e. unreliable ones."""
+        if self.viewport is None:
+            return ()
+        vx, vy, vw, vh = self.viewport
+        inside = []
+        for anchor in self.anchors:
+            if anchor.region is None:
+                continue
+            ax, ay, aw, ah = anchor.region
+            # Any overlap at all is suspect.
+            if not (
+                ax + aw <= vx or vx + vw <= ax or ay + ah <= vy or vy + vh <= ay
+            ):
+                inside.append(anchor)
+        return tuple(inside)
 
     def score(self, frame_gray: np.ndarray) -> tuple[float, list[AnchorMatch]]:
         """Score this screen against a frame.
@@ -348,6 +383,124 @@ class Classification:
         return f"{self.screen} ({self.score:.3f})"
 
 
+def _clamp_outside_viewport(
+    crop: Region, padded: Region, viewport: Region
+) -> Region:
+    """Shrink a padded search box so it stays clear of the scrolling viewport.
+
+    Only applies when the crop itself sits wholly outside the viewport - that
+    is, a genuine HUD anchor. The box is pulled back along whichever axis
+    separates the two. A crop that overlaps the viewport is left alone, since
+    there is nothing sensible to clamp it to, and save_screen_definition warns
+    about it separately.
+    """
+    cx, cy, cw, ch = crop
+    px, py, pw, ph = padded
+    vx, vy, vw, vh = viewport
+
+    if cy + ch <= vy:  # crop sits above the viewport
+        ph = min(ph, max(1, vy - py))
+    elif vy + vh <= cy:  # below
+        new_py = max(py, vy + vh)
+        ph = max(1, ph - (new_py - py))
+        py = new_py
+    elif cx + cw <= vx:  # left
+        pw = min(pw, max(1, vx - px))
+    elif vx + vw <= cx:  # right
+        new_px = max(px, vx + vw)
+        pw = max(1, pw - (new_px - px))
+        px = new_px
+
+    return px, py, pw, ph
+
+
+def find_all(
+    frame,
+    template: np.ndarray,
+    threshold: float = DEFAULT_THRESHOLD,
+    region: Region | None = None,
+    mask: np.ndarray | None = None,
+    max_results: int = 50,
+    normalize: bool = True,
+) -> list[AnchorMatch]:
+    """Find every occurrence of a template, wherever it is.
+
+    Anchors match once, in a known place, because they identify a screen. This
+    is the opposite job: locating repeated content whose position is not known
+    in advance - every node on a scrollable sector map, say - because the
+    player may have dragged the map anywhere.
+
+    Overlapping detections of the same thing are collapsed, keeping the
+    strongest, so a node is reported once rather than as a cluster of
+    near-identical hits.
+
+    Coordinates are in working-resolution pixels. On a scrolling screen they
+    are only valid for this frame; use scroll.ScrollTracker to convert them
+    into coordinates that survive scrolling.
+
+    Pass `normalize=False` when searching a stitched panorama rather than a
+    screen, so it is not rescaled to the size of one.
+    """
+    gray = _as_gray(frame, normalize=normalize)
+
+    offset_x = offset_y = 0
+    if region is not None:
+        x, y, w, h = region
+        x = max(0, min(x, gray.shape[1] - 1))
+        y = max(0, min(y, gray.shape[0] - 1))
+        w = max(1, min(w, gray.shape[1] - x))
+        h = max(1, min(h, gray.shape[0] - y))
+        gray = gray[y : y + h, x : x + w]
+        offset_x, offset_y = x, y
+
+    template_h, template_w = template.shape[:2]
+    if template_h > gray.shape[0] or template_w > gray.shape[1]:
+        return []
+
+    if mask is None:
+        result = cv2.matchTemplate(gray, template, cv2.TM_CCOEFF_NORMED)
+    else:
+        result = cv2.matchTemplate(gray, template, cv2.TM_CCOEFF_NORMED, mask=mask)
+        result = np.clip(np.nan_to_num(result, nan=0.0), -1.0, 1.0)
+
+    ys, xs = np.where(result >= threshold)
+    if ys.size == 0:
+        return []
+
+    candidates = sorted(
+        (
+            (float(result[y, x]), int(x), int(y))
+            for y, x in zip(ys.tolist(), xs.tolist())
+        ),
+        key=lambda item: -item[0],
+    )
+
+    # Greedy non-maximum suppression: keep the best, drop anything overlapping
+    # it by more than half a template.
+    kept: list[AnchorMatch] = []
+    for score, x, y in candidates:
+        if any(
+            abs(x + offset_x - m.x) < template_w * 0.5
+            and abs(y + offset_y - m.y) < template_h * 0.5
+            for m in kept
+        ):
+            continue
+        kept.append(
+            AnchorMatch(
+                anchor="match",
+                score=score,
+                x=x + offset_x,
+                y=y + offset_y,
+                width=template_w,
+                height=template_h,
+            )
+        )
+        if len(kept) >= max_results:
+            break
+
+    return kept
+
+
 def load_screen(directory: Path) -> ScreenDefinition:
     """Load one screen definition from its folder."""
     manifest_path = directory / "screen.json"
@@ -388,11 +541,13 @@ def load_screen(directory: Path) -> ScreenDefinition:
             )
         )
 
+    viewport = manifest.get("viewport")
     return ScreenDefinition(
         name=manifest.get("name", directory.name),
         anchors=tuple(anchors),
         threshold=float(manifest.get("threshold", DEFAULT_THRESHOLD)),
         description=manifest.get("description", ""),
+        viewport=tuple(viewport) if viewport else None,
     )
 
 
@@ -456,6 +611,7 @@ def save_screen_definition(
     threshold: float = DEFAULT_THRESHOLD,
     search_padding: int = 40,
     burst: list | None = None,
+    viewport: Region | None = None,
 ) -> Path:
     """Create a screen definition by cropping an anchor out of a frame.
 
@@ -523,6 +679,13 @@ def save_screen_definition(
     sw = min(WORK_WIDTH - sx, w + search_padding * 2)
     sh = min(WORK_HEIGHT - sy, h + search_padding * 2)
 
+    if viewport is not None:
+        # A HUD anchor's padded box must not spill into the scrolling area, or
+        # we would be hunting for fixed furniture inside moving content.
+        sx, sy, sw, sh = _clamp_outside_viewport(
+            (x, y, w, h), (sx, sy, sw, sh), tuple(viewport)
+        )
+
     # Prove the anchor works before writing it, by matching it against the very
     # frame it was cut from. An anchor that cannot recognise its own source
     # will certainly not recognise a live screen, and this catches the failure
@@ -554,12 +717,23 @@ def save_screen_definition(
     if mask_name:
         anchor_entry["mask"] = mask_name
 
-    manifest = {
+    manifest: dict = {
         "name": name,
         "description": description,
         "threshold": threshold,
         "anchors": [anchor_entry],
     }
+    if viewport is not None:
+        manifest["viewport"] = list(viewport)
+        vx, vy, vw, vh = viewport
+        if not (x + w <= vx or vx + vw <= x or y + h <= vy or vy + vh <= y):
+            warnings.warn(
+                f"Anchor region {region} overlaps the scrolling viewport "
+                f"{tuple(viewport)}. Content there moves when the player drags, "
+                f"so this anchor will stop matching. Crop from the fixed HUD "
+                f"outside the viewport instead.",
+                stacklevel=2,
+            )
     (target / "screen.json").write_text(
         json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
     )

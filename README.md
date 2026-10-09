@@ -249,6 +249,9 @@ for the full inventory and a per-screen workflow.
 If a screen animates — most do — use a burst so the motion gets masked out.
 See [Animated screens](#animated-screens).
 
+If a screen **scrolls** — the sector map does — anchor on the fixed HUD, not
+the content. See [Scrollable screens](#scrollable-screens).
+
 ---
 
 ## Command reference
@@ -262,6 +265,8 @@ See [Animated screens](#animated-screens).
 | `learn NAME --image FILE` | teach the bot to recognise a screen |
 | `grab --label NAME --burst 5` | capture a burst into a folder, to reveal animation |
 | `stability --image DIR` | show what moves; suggest where to crop |
+| `hud --image DIR` | split a scrollable screen into fixed HUD vs content |
+| `scroll-map --image DIR` | stitch a dragged sequence into one wide image |
 | `identify -v` | say which screen is showing, with scores |
 | `check` | grade every capture in a folder; catches leaky anchors |
 | `screens` | list the screens the bot knows |
@@ -329,6 +334,85 @@ Note the asymmetry, since it drives two different guards:
 Every saved anchor is also matched against the frame it was cut from, so an
 anchor that cannot recognise its own source is refused rather than written out.
 
+## Scrollable screens
+
+A different problem from animation, and a harder one. The sector map is a
+canvas wider than the window: you drag it left and right. So the same *screen*
+has endless appearances, and a node's pixel position means nothing on its own.
+
+Two things follow.
+
+### Identity comes from the HUD, never the content
+
+Every scrollable screen has furniture that does not move — the header, the
+sector label, the energy bar. That is the only safe place to anchor identity.
+
+Finding it is the same trick as before with a different burst: capture
+**while dragging the map**, and whatever holds still is by definition not
+scrolling content.
+
+```powershell
+python -m swgoh_bot.cli grab --label sector_map --burst 8
+# drag the map steadily during that capture
+python -m swgoh_bot.cli hud --image data\captures\sector_map-burst-<stamp> --label sector_map
+```
+
+```
+Bands, top to bottom:
+  y   0-111  FIXED      header / HUD
+  y 111-820  SCROLLING  content
+  y 820-900  FIXED      footer / HUD
+
+Suggested viewport: 0,111,1600,709
+
+Anchor regions in the FIXED bands, strongest first:
+  1. region 40,0,220,80          header  static 100.0%  detail 30.4
+```
+
+Teach it from the header, recording the viewport so the tooling knows where
+the scrolling area is:
+
+```powershell
+python -m swgoh_bot.cli learn sector_map --image data\captures\sector_map-burst-<stamp> --region 40,0,220,80 --viewport 0,111,1600,709
+```
+
+That identifies the screen at **1.000 at every scroll position**. The anchor's
+search box is also clamped so it never reaches into the scrolling area.
+
+Anchor inside the viewport instead and `learn` warns you, `screens` flags it,
+and the failure is nastier than you would expect: sector maps are full of
+*repeated node icons*, so after scrolling the anchor matches a **different
+node** at 0.93 — right screen, wrong reason, meaningless position.
+
+### Content is found by appearance, then converted to stable coordinates
+
+`vision.find_all` locates every instance of a template anywhere in the
+viewport, collapsing overlapping hits, so you get each node once no matter
+where the map has been dragged.
+
+To act on a node you need a coordinate that survives scrolling.
+`scroll.measure_shift` recovers how far the content moved between two frames
+using phase correlation — accurate to about a hundredth of a pixel, and not
+fooled by the HUD being in frame. `scroll.ScrollTracker` accumulates that into
+an offset, so `to_world` and `to_viewport` convert between "where it is on
+screen now" and a fixed coordinate. That is what lets the bot decide a target
+is off-screen and which way to drag.
+
+### Or map the whole thing once
+
+```powershell
+python -m swgoh_bot.cli scroll-map --image data\captures\sector_map-burst-<stamp> --screen sector_map
+```
+
+Drag from one end to the other while capturing and this reassembles the sector
+into a single image. On the test fixture it measured a 2500px drag exactly,
+produced the predicted 4100x709 panorama, and all 14 nodes were then located at
+their exact world positions. Every node gets found once, in coordinates that
+never shift.
+
+Accumulated offsets do drift, so re-anchor on something known rather than
+trusting a tracker indefinitely.
+
 ## How it works
 
 ```
@@ -359,12 +443,16 @@ one canonical size. A screen taught at 1080p therefore still matches at 1440p
 or in a resized window. Aspect ratio is deliberately not preserved; since both
 sides get the same distortion, matching is unaffected.
 
+**`scroll.py`** handles screens larger than the window: measuring scroll
+distance, tracking an absolute offset, and stitching a dragged sequence into a
+panorama.
+
 **`vision.py`** does template matching, not machine learning. Each screen is a
 folder under `data/screens/`:
 
 ```
 data/screens/home/
-    screen.json        name, threshold, where to look for each anchor
+    screen.json        name, threshold, anchor regions, viewport if it scrolls
     anchor_home.png    the cropped template
     mask_home.png      which of those pixels to compare (if taught --burst)
     reference.png      the full screen, kept for debugging
@@ -382,9 +470,10 @@ otherwise the answer is `unknown`, never a guess.
 python -m pytest tests/ -q
 ```
 
-78 tests, no Windows and no game required. They cover the settings layer, the
-capture backends, the vision engine — including the cross-resolution claim and
-the animation-masking figures above — and the leak detection in `check`.
+106 tests, no Windows and no game required. They cover the settings layer, the
+capture backends, the vision engine — including the cross-resolution claim, the
+animation-masking figures and the scroll figures above — the scroll tracker and
+stitcher, and the leak detection in `check`.
 
 ---
 
@@ -432,6 +521,8 @@ that screen.
       Heroes`) with the `mss` backend.
 - [x] **Step 1.5 — Survive animation.** Burst capture, stability masking,
       anchor suggestion.
+- [x] **Step 1.6 — Survive scrolling.** HUD/content split, scroll measurement,
+      world coordinates, panorama stitching.
 - [ ] **Step 2 — Read.** OCR for stamina numbers, feat text, energy counts.
       Also the fallback for screens with no static anchor at all.
 - [ ] **Step 3 — Act.** Move the cursor and click. Safety first: a global
