@@ -274,6 +274,117 @@ def cmd_learn(args) -> int:
     return 0
 
 
+def expected_label(path: Path) -> str:
+    """Infer which screen a captured file is meant to be, from its name.
+
+    `grab --label home` writes "home-20261009-143000.png", so the label is
+    everything before the two trailing numeric parts. A file named anything
+    else falls back to its whole stem.
+    """
+    parts = path.stem.split("-")
+    if len(parts) >= 3 and parts[-1].isdigit() and parts[-2].isdigit():
+        return "-".join(parts[:-2])
+    return path.stem
+
+
+def cmd_check(args) -> int:
+    """Classify a whole folder of captures at once and grade the results.
+
+    This is the honesty check on your anchors. A single screen matching itself
+    at 0.99 proves nothing - the question is whether it *also* matches every
+    other screen. Running the full set catches an anchor that cropped
+    persistent UI chrome rather than something screen-specific.
+    """
+    from swgoh_bot.capture import ReplayBackend
+    from swgoh_bot.vision import ScreenClassifier
+
+    directory = Path(args.dir) if args.dir else CAPTURES_DIR
+    if not directory.is_dir():
+        print(f"No such folder: {directory}")
+        return 1
+
+    classifier = ScreenClassifier.from_directory()
+    if not classifier.screens:
+        print("No screens taught yet. Use `learn` first.")
+        return 1
+
+    known = {screen.name for screen in classifier.screens}
+
+    try:
+        backend = ReplayBackend(directory)
+    except FileNotFoundError as exc:
+        print(f"{exc}")
+        return 1
+
+    rows = []
+    for path in backend.paths:
+        result = classifier.classify(ReplayBackend(path).grab())
+        rows.append((path, expected_label(path), result))
+
+    name_width = max(len(p.name) for p, _, _ in rows)
+    name_width = max(name_width, 4)
+    print(
+        f"{'file':<{name_width}}  {'expected':<16}  {'detected':<16}  "
+        f"{'score':>6}  verdict"
+    )
+    print(f"{'-' * name_width}  {'-' * 16}  {'-' * 16}  {'-' * 6}  -------")
+
+    correct = wrong = untaught = 0
+    leaked: dict[str, list[str]] = {}
+
+    for path, expected, result in rows:
+        detected = result.screen or "unknown"
+        score = f"{result.score:.3f}" if result.recognised else "-"
+
+        if expected not in known:
+            # We never taught this screen. Anything matching it means some
+            # other screen's anchor is not specific enough.
+            if result.recognised:
+                verdict = "LEAK"
+                leaked.setdefault(detected, []).append(expected)
+                wrong += 1
+            else:
+                verdict = "(not taught)"
+                untaught += 1
+        elif detected == expected:
+            verdict = "ok"
+            correct += 1
+        else:
+            verdict = "WRONG"
+            wrong += 1
+
+        print(
+            f"{path.name:<{name_width}}  {expected:<16}  {detected:<16}  "
+            f"{score:>6}  {verdict}"
+        )
+
+        if args.verbose:
+            for name, value in sorted(result.scores.items(), key=lambda kv: -kv[1]):
+                print(f"{'':<{name_width}}    {value:.3f}  {name}")
+
+    print()
+    print(f"{correct} correct, {wrong} wrong, {untaught} not yet taught")
+
+    if leaked:
+        print()
+        print("Non-discriminating anchors detected:")
+        for screen, others in leaked.items():
+            targets = ", ".join(sorted(set(others)))
+            print(f"  {screen!r} also matches: {targets}")
+        print()
+        print("That anchor is probably persistent UI chrome - a nav bar, a")
+        print("resource counter, something on every screen. Delete the folder")
+        print(f"data/screens/<name>/ and re-run `learn`, cropping something")
+        print("that only appears on that one screen.")
+        return 2
+
+    if wrong:
+        return 2
+    if untaught:
+        print("Teach the remaining screens with `learn` to finish the check.")
+    return 0
+
+
 def cmd_screens(args) -> int:
     """List the screens the bot currently recognises."""
     from swgoh_bot.vision import ScreenClassifier
@@ -353,6 +464,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--description", default="", help="human note about this screen")
     p.add_argument("--threshold", type=float, default=0.85, help="match threshold")
     p.set_defaults(func=cmd_learn)
+
+    p = sub.add_parser(
+        "check", help="classify every capture in a folder and grade the results"
+    )
+    p.add_argument("--dir", help=f"folder of captures (default: {CAPTURES_DIR})")
+    p.add_argument("-v", "--verbose", action="store_true", help="show every score")
+    p.set_defaults(func=cmd_check)
 
     p = sub.add_parser("screens", help="list known screens")
     p.set_defaults(func=cmd_screens)

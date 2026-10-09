@@ -35,6 +35,9 @@ WORK_HEIGHT = 900
 # The PC client's real window title is unconfirmed - `python -m swgoh_bot.cli
 # windows` prints every window so we can find out and pin it down.
 WINDOW_TITLE_CANDIDATES = (
+    # Confirmed title of the official PC client, as reported by the client
+    # itself on a real install.
+    "Star Wars: Galaxy of Heroes",
     "Galaxy of Heroes",
     "SWGOH",
     "Star Wars",

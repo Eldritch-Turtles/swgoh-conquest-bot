@@ -197,10 +197,50 @@ python -m swgoh_bot.cli identify -v
 You should see `screen: home (0.9xx)`. Navigate somewhere else in the game and
 run it again — now it should say `unknown`.
 
-**That's step 1 complete.** The bot can see.
+### 10. Prove the anchor is actually discriminating
 
-Repeat step 8 for each screen you captured, then tell me how it went — the
-scores from `identify -v` are what I need to tune thresholds for step 2.
+A screen matching itself at 0.99 proves the plumbing works. It does **not**
+prove your anchor is specific to that screen. If you happened to crop
+persistent UI chrome — a nav bar, a resource counter, anything present
+everywhere — it will match `home` on every screen in the game, and `identify`
+alone will never tell you.
+
+`check` classifies every capture in `data/captures/` at once and grades the
+results against the labels you gave `grab`:
+
+```powershell
+python -m swgoh_bot.cli check
+```
+
+```
+file                              expected          detected           score  verdict
+--------------------------------  ----------------  ----------------  ------  -------
+conquest_map-20261009-143000.png  conquest_map      home               1.000  LEAK
+home-20261009-143000.png          home              home               1.000  ok
+squad_select-20261009-143000.png  squad_select      home               1.000  LEAK
+
+1 correct, 2 wrong, 0 not yet taught
+
+Non-discriminating anchors detected:
+  'home' also matches: conquest_map, squad_select
+```
+
+`LEAK` means that anchor matched a screen it was never taught — the giveaway
+for cropped chrome. Fix it by deleting `data/screens/<name>/` and re-running
+`learn`, this time cropping something that appears *only* on that screen.
+
+`(not taught)` is fine; it just means you haven't got to that screen yet.
+
+Aim for every row reading `ok`:
+
+```
+3 correct, 0 wrong, 0 not yet taught
+```
+
+**That's step 1 complete.** The bot can see, and you can prove it.
+
+Repeat steps 8 and 10 for each screen you captured, then tell me how it went —
+the `check` table is what I need to tune thresholds for step 2.
 
 ---
 
@@ -214,6 +254,7 @@ scores from `identify -v` are what I need to tune thresholds for step 2.
 | `grab --label NAME` | screenshot the game into `data/captures/` |
 | `learn NAME --image FILE` | teach the bot to recognise a screen |
 | `identify -v` | say which screen is showing, with scores |
+| `check` | grade every capture in a folder; catches leaky anchors |
 | `screens` | list the screens the bot knows |
 
 Any command takes `--image PATH` to read a saved PNG instead of the live game,
@@ -273,9 +314,9 @@ otherwise the answer is `unknown`, never a guess.
 python -m pytest tests/ -q
 ```
 
-42 tests, no Windows and no game required. They cover the settings layer, the
-capture backends and the vision engine, including the cross-resolution claim
-above.
+54 tests, no Windows and no game required. They cover the settings layer, the
+capture backends, the vision engine — including the cross-resolution claim
+above — and the leak detection in `check`.
 
 ---
 
@@ -309,15 +350,18 @@ Close to the threshold means the anchor is too generic — re-run `learn` and pi
 something more distinctive. Near zero means the anchor is being searched in the
 wrong place; check `region` in that screen's `screen.json`.
 
-**Everything matches everything.** An anchor is too plain. Delete that screen's
-folder under `data/screens/` and re-learn it with a region containing text or an
-icon.
+**Everything matches everything.** An anchor is too plain, or it cropped UI
+chrome present on every screen. Run `check` to confirm, then delete that
+screen's folder under `data/screens/` and re-learn it from a region unique to
+that screen.
 
 ---
 
 ## Roadmap
 
 - [x] **Step 1 — See.** Find the window, capture frames, identify screens.
+      Verified working against the real PC client (`Star Wars: Galaxy of
+      Heroes`) with the `mss` backend.
 - [ ] **Step 2 — Read.** OCR for stamina numbers, feat text, energy counts.
 - [ ] **Step 3 — Act.** Move the cursor and click. Safety first: a global
       abort hotkey and a dry-run mode before anything taps for real.
