@@ -173,7 +173,10 @@ def find_window(title_contains: str | Iterable[str]) -> WindowInfo:
 
 
 def find_game_window() -> WindowInfo:
-    """Locate the SWGOH PC client using the configured title guesses."""
-    from swgoh_bot.config import WINDOW_TITLE_CANDIDATES
+    """Locate the SWGOH PC client.
 
-    return find_window(WINDOW_TITLE_CANDIDATES)
+    Tries the title saved by `cli set-window` first, then the built-in guesses.
+    """
+    from swgoh_bot.config import window_title_candidates
+
+    return find_window(window_title_candidates())

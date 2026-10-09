@@ -7,6 +7,7 @@ into a proper settings model.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -38,3 +39,46 @@ WINDOW_TITLE_CANDIDATES = (
     "SWGOH",
     "Star Wars",
 )
+
+
+# Machine-specific settings, written by the CLI rather than edited by hand.
+# Git-ignored: the window title and layout are particular to your PC.
+SETTINGS_PATH = REPO_ROOT / "bot_settings.json"
+
+
+def load_settings() -> dict:
+    """Read bot_settings.json, or return {} if it's absent or corrupt."""
+    if not SETTINGS_PATH.is_file():
+        return {}
+    try:
+        data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_settings(settings: dict) -> None:
+    """Write bot_settings.json."""
+    SETTINGS_PATH.write_text(
+        json.dumps(settings, indent=2) + "\n", encoding="utf-8"
+    )
+
+
+def update_settings(**changes) -> dict:
+    """Merge changes into bot_settings.json and return the result."""
+    settings = load_settings()
+    settings.update(changes)
+    save_settings(settings)
+    return settings
+
+
+def window_title_candidates() -> tuple[str, ...]:
+    """Titles to try when hunting for the game window, best first.
+
+    A title saved via `cli set-window` takes priority over the built-in
+    guesses, so nobody has to edit this file to get going.
+    """
+    saved = load_settings().get("window_title")
+    if isinstance(saved, str) and saved.strip():
+        return (saved,) + WINDOW_TITLE_CANDIDATES
+    return WINDOW_TITLE_CANDIDATES

@@ -9,3 +9,6 @@ venv/
 env/
 .vscode/
 .idea/
+
+# Machine-specific: your window title, your layout.
+bot_settings.json

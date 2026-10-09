@@ -3,8 +3,8 @@
 An automation bot for Conquest in *Star Wars: Galaxy of Heroes*, targeting the
 **official PC client** on Windows.
 
-**Status: step 1 of many.** Right now the bot can *see* the game. It cannot
-click anything yet. That is deliberate — see [Roadmap](#roadmap).
+**Status: step 1 of 7.** Right now the bot can *see* the game. It cannot click
+anything yet. That is deliberate — see [Roadmap](#roadmap).
 
 ---
 
@@ -19,110 +19,205 @@ Two more things worth knowing before you invest time:
 - **The bot will control your mouse.** DirectX games generally ignore synthetic
   click messages, so from step 3 onward the bot has to move the real cursor.
   While it runs, the computer is busy.
-- **Conquest data is hand-maintained.** There is no API anywhere that publishes
-  Conquest feats, node layouts, or disk modifiers, and they change every
-  season. swgoh.gg and comlink give you *roster* data; ahnaldt101 and Reddit
-  give you *strategy in prose*. Neither gives you a machine-readable feat list.
-  Expect to update a season file by hand roughly monthly.
+- **Conquest data is hand-maintained.** No API anywhere publishes Conquest
+  feats, node layouts or disk modifiers, and they change every season.
+  swgoh.gg and comlink give you *roster* data; ahnaldt101 and Reddit give you
+  *strategy in prose*. Expect to update a season file by hand roughly monthly.
 
 ---
 
-## Setup (Windows)
+## Step 1 walkthrough
 
-You need Python 3.11 or newer. Get it from [python.org](https://www.python.org/downloads/)
-and **tick "Add Python to PATH"** during install.
+Nothing here clicks anything in the game or sends any data anywhere. Worst case
+you get some PNGs in a folder.
 
-Open PowerShell in the folder where you want the project:
+### 1. Install Python
+
+Download Python 3.11 or newer from [python.org/downloads](https://www.python.org/downloads/).
+
+In the installer, **tick the "Add python.exe to PATH" checkbox** at the bottom
+of the first screen before clicking Install. This is the single most common
+thing to get wrong; without it, none of the commands below are found.
+
+Verify it worked — press `Win+X`, choose **Terminal** (or **PowerShell**), and run:
 
 ```powershell
-git clone https://github.com/Eldritch-Turtles/swgoh-conquest-bot.git
-cd swgoh-conquest-bot
-
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-
-pip install -r requirements.txt
+python --version
 ```
 
-If PowerShell refuses to run the activate script, run this once and try again:
+You want `Python 3.11.x` or higher. If you get an error or the Microsoft Store
+opens, PATH wasn't ticked: re-run the installer, choose Modify, and add it.
+
+### 2. Get the code
+
+If you have Git installed:
+
+```powershell
+cd ~\Documents
+git clone https://github.com/Eldritch-Turtles/swgoh-conquest-bot.git
+cd swgoh-conquest-bot
+git checkout claude/swgoh-conquest-bot-sm360w
+```
+
+No Git? Download the branch as a ZIP from GitHub (**Code → Download ZIP**),
+extract it to `Documents`, then open a terminal in that folder: shift-right-click
+the extracted folder and choose **Open in Terminal**.
+
+Confirm you're in the right place — this should list `README.md` and `swgoh_bot`:
+
+```powershell
+dir
+```
+
+### 3. Create a virtual environment
+
+A venv keeps this project's packages separate from the rest of your system.
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+```
+
+Your prompt should now start with `(.venv)`. If instead you get
+*"running scripts is disabled on this system"*, run this once and retry:
 
 ```powershell
 Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
 ```
 
-Check everything landed:
+You need to run the `Activate.ps1` line again every time you open a new
+terminal for this project.
+
+### 4. Install the dependencies
+
+```powershell
+pip install -r requirements.txt
+```
+
+Takes a minute or two — OpenCV is a large download.
+
+### 5. Check the install
 
 ```powershell
 python -m swgoh_bot.cli doctor
 ```
 
----
+Expected: `cv2`, `numpy`, `mss` and `pillow` all `[ok]`. `windows_capture` and
+`pytesseract` showing `[missing]` is fine — they're optional and not needed
+yet. Don't worry about the game window line yet.
 
-## Step 1: teaching the bot to see
+### 6. Find the game window
 
-### 1. Find the game window
-
-Start the SWGOH PC client, then:
+**Start the SWGOH PC client** and get to the home screen. Leave it open and
+visible — don't minimise it. Back in the terminal:
 
 ```powershell
 python -m swgoh_bot.cli windows
 ```
 
-This lists every open window with its size and title. Find the Galaxy of Heroes
-one. If its title isn't already matched, add it to `WINDOW_TITLE_CANDIDATES` in
-`swgoh_bot/config.py`.
+You get a numbered list of every open window, largest first, like:
 
-Confirm the bot can find it:
+```
+  #         size  title
+---  -----------  --------------------------------------------------
+  1   1920x1080   STAR WARS™: Galaxy of Heroes
+  2   1280x720    EA app
+  3    900x600    Windows PowerShell
+```
+
+Find the Galaxy of Heroes one — it's almost certainly one of the largest — and
+lock it in by number:
+
+```powershell
+python -m swgoh_bot.cli set-window 1
+```
+
+That writes the title to `bot_settings.json`. You only do this once. Confirm:
 
 ```powershell
 python -m swgoh_bot.cli doctor
 ```
 
-The "game window" line should now show its dimensions.
+The "game window" section should now print the window's size and position.
 
-### 2. Capture some screens
+**If no window looks like the game:** the client may render into a child window
+with an odd title. Look for one whose size matches the game area. You can also
+set the title directly if you can read it from the title bar:
 
-With the game on its home screen:
+```powershell
+python -m swgoh_bot.cli set-window "STAR WARS™: Galaxy of Heroes"
+```
+
+### 7. Take your first screenshot
+
+With the game on its **home screen**:
 
 ```powershell
 python -m swgoh_bot.cli grab --label home
 ```
 
-The PNG lands in `data/captures/`. Repeat on each screen you care about
-(`--label conquest_map`, `--label battle_result`, and so on). Open them and
-check they show the game and not a black rectangle — if they're black, see
-[Troubleshooting](#troubleshooting).
+It prints where it saved the PNG — inside `data\captures\`. **Open that file and
+look at it.** You should see the game's home screen.
 
-### 3. Teach it what it's looking at
+If it's black, empty or shows your desktop, see [Troubleshooting](#troubleshooting).
 
-```powershell
-python -m swgoh_bot.cli learn home --image data/captures/home-20260905-143000.png
-```
-
-A window opens showing the screenshot. **Drag a box around something unique to
-that screen** — a title, a button label, a distinctive icon — then press ENTER.
-
-Pick something with detail in it. A flat patch of background is rejected on
-purpose: a featureless template matches *every* screen at full confidence, which
-would poison the whole classifier.
-
-You can skip the interactive step if you already know the coordinates:
+Now repeat on the other screens, navigating the game by hand between each:
 
 ```powershell
-python -m swgoh_bot.cli learn home --image data/captures/home.png --region 1180,380,340,240
+python -m swgoh_bot.cli grab --label conquest_map
+python -m swgoh_bot.cli grab --label squad_select
+python -m swgoh_bot.cli grab --label battle_result
 ```
 
-### 4. Check it works
+### 8. Teach the bot one screen
+
+```powershell
+python -m swgoh_bot.cli learn home --image data\captures\home-20261009-143000.png
+```
+
+Use the actual filename that `grab` printed. A window opens showing your
+screenshot.
+
+**Drag a box around something unique to that screen** — a title, a button
+label, a distinctive icon — then press **Enter**.
+
+Pick something with detail in it. A plain patch of background gets rejected on
+purpose: a featureless template matches *every* screen at full confidence,
+which would poison the whole classifier. If you get a "featureless" error, just
+run the command again and pick something with text or an icon in it.
+
+### 9. Check that it works
+
+Bring the game back to its home screen, then:
 
 ```powershell
 python -m swgoh_bot.cli identify -v
 ```
 
-With the game on the home screen this should print `screen: home (0.9xx)`.
-Navigate elsewhere and run it again — it should say `unknown`, or name the other
-screen if you've taught it.
+You should see `screen: home (0.9xx)`. Navigate somewhere else in the game and
+run it again — now it should say `unknown`.
 
-`-v` shows every screen's score, which is what you want when tuning.
+**That's step 1 complete.** The bot can see.
+
+Repeat step 8 for each screen you captured, then tell me how it went — the
+scores from `identify -v` are what I need to tune thresholds for step 2.
+
+---
+
+## Command reference
+
+| command | what it does |
+|---|---|
+| `doctor` | check dependencies, window and known screens |
+| `windows` | numbered list of open windows |
+| `set-window <n\|title>` | remember which window is the game |
+| `grab --label NAME` | screenshot the game into `data/captures/` |
+| `learn NAME --image FILE` | teach the bot to recognise a screen |
+| `identify -v` | say which screen is showing, with scores |
+| `screens` | list the screens the bot knows |
+
+Any command takes `--image PATH` to read a saved PNG instead of the live game,
+which is how you work on this without the game running.
 
 ---
 
@@ -140,25 +235,24 @@ scaling doesn't skew coordinates.
 
 **`capture.py`** has three interchangeable backends:
 
-| backend  | what it does                                    | when to use |
-|----------|-------------------------------------------------|-------------|
-| `mss`    | screenshots the desktop region the window covers | default; window must be visible |
-| `wgc`    | Windows Graphics Capture                         | works when the window is buried; needs `windows-capture` |
-| `replay` | reads PNGs off disk                              | testing, and developing without the game running |
+| backend | what it does | when to use |
+|---|---|---|
+| `mss` | screenshots the desktop region the window covers | default; window must be visible |
+| `wgc` | Windows Graphics Capture | works when the window is buried; needs `windows-capture` |
+| `replay` | reads PNGs off disk | testing, and developing without the game |
 
 The `replay` backend is why the test suite runs on any OS with no game
-installed — and it's how you can send screenshots to someone else to work from.
+installed — and it's how you can hand screenshots to someone else to work from.
 
 **Every frame is squashed to 1600x900 before any matching.** This is the key
 decision in the vision layer: rather than writing resolution-independent
 matching, we normalise everything — frames and reference templates alike — to
-one canonical size. A screen taught at 1080p therefore still matches at 1440p or
-in a resized window. Aspect ratio is deliberately not preserved; since both
+one canonical size. A screen taught at 1080p therefore still matches at 1440p
+or in a resized window. Aspect ratio is deliberately not preserved; since both
 sides get the same distortion, matching is unaffected.
 
 **`vision.py`** does template matching, not machine learning. Each screen is a
-folder under `data/screens/` containing a manifest and one or more cropped
-"anchor" images:
+folder under `data/screens/`:
 
 ```
 data/screens/home/
@@ -167,8 +261,8 @@ data/screens/home/
     reference.png      the full screen, kept for debugging
 ```
 
-A screen's score is its **weakest** anchor — every anchor must be present — which
-keeps false positives down. The best screen clearing its threshold wins;
+A screen's score is its **weakest** anchor — every anchor must be present —
+which keeps false positives down. The best screen clearing its threshold wins;
 otherwise the answer is `unknown`, never a guess.
 
 ---
@@ -179,33 +273,45 @@ otherwise the answer is `unknown`, never a guess.
 python -m pytest tests/ -q
 ```
 
-29 tests, no Windows and no game required. They cover the capture backends and
-the vision engine, including the cross-resolution claim above.
+42 tests, no Windows and no game required. They cover the settings layer, the
+capture backends and the vision engine, including the cross-resolution claim
+above.
 
 ---
 
 ## Troubleshooting
 
-**`windows` shows nothing / can't find the client.** The PC client may render
-into a child window with a different title than the launcher. Run `windows`
-with no filter and look for one whose dimensions match the game area.
+**`python` isn't recognised.** PATH wasn't ticked during install. Re-run the
+Python installer, choose Modify, and tick "Add python.exe to PATH".
+
+**`Activate.ps1 cannot be loaded`.** Run
+`Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` once, then retry.
+
+**`windows` shows nothing like the game.** The PC client may render into a child
+window with a different title than the launcher. Look for one whose dimensions
+match the game area rather than going by title.
 
 **Screenshots come out black.** The `mss` backend captures the desktop, so it
-fails on GPU-exclusive rendering. Try windowed or borderless mode, or switch to
-the WGC backend:
+fails against GPU-exclusive rendering. Try windowed or borderless mode in the
+game's settings first. If that doesn't fix it, switch backend:
 
 ```powershell
 pip install windows-capture
 python -m swgoh_bot.cli grab --backend wgc --label home
 ```
 
-**`identify` says `unknown` when it shouldn't.** Run with `-v` to see the actual
-score. If it's close to the threshold, the anchor is too generic — re-run
-`learn` and pick something more distinctive. If it's near zero, the anchor is
-probably being searched in the wrong place; check the `region` in `screen.json`.
+**Screenshots show the wrong thing / my desktop.** The game window was behind
+something, or minimised. `mss` grabs whatever pixels are on screen in that
+region. Keep the game visible, or use the `wgc` backend.
 
-**Everything matches everything.** An anchor is too plain. Delete that screen
-folder and re-learn it with a region containing text or an icon.
+**`identify` says `unknown` when it shouldn't.** Run with `-v` to see the score.
+Close to the threshold means the anchor is too generic — re-run `learn` and pick
+something more distinctive. Near zero means the anchor is being searched in the
+wrong place; check `region` in that screen's `screen.json`.
+
+**Everything matches everything.** An anchor is too plain. Delete that screen's
+folder under `data/screens/` and re-learn it with a region containing text or an
+icon.
 
 ---
 

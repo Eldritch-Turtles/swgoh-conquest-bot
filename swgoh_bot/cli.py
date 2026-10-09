@@ -16,7 +16,16 @@ from datetime import datetime
 from pathlib import Path
 
 from swgoh_bot import __version__
-from swgoh_bot.config import CAPTURES_DIR, SCREENS_DIR, WORK_HEIGHT, WORK_WIDTH
+from swgoh_bot.config import (
+    CAPTURES_DIR,
+    SCREENS_DIR,
+    SETTINGS_PATH,
+    WORK_HEIGHT,
+    WORK_WIDTH,
+    load_settings,
+    update_settings,
+    window_title_candidates,
+)
 
 
 def _open_backend(args):
@@ -55,6 +64,12 @@ def cmd_doctor(args) -> int:
     print("game window")
     from swgoh_bot.window import IS_WINDOWS, WindowNotFoundError, find_game_window
 
+    saved = load_settings().get("window_title")
+    if saved:
+        print(f"  configured title: {saved!r}")
+    else:
+        print(f"  no title set yet; guessing from {list(window_title_candidates())}")
+
     if not IS_WINDOWS:
         print("  [skip]    not on Windows - use --image to work from saved captures")
     else:
@@ -78,7 +93,11 @@ def cmd_doctor(args) -> int:
 
 
 def cmd_windows(args) -> int:
-    """Dump every titled window so we can identify the game client."""
+    """Dump every titled window, numbered, so we can identify the game client.
+
+    The listing is saved to bot_settings.json so `set-window <number>` can
+    refer back to it. That spares the user from retyping a long title.
+    """
     from swgoh_bot.window import IS_WINDOWS, enumerate_windows
 
     if not IS_WINDOWS:
@@ -87,21 +106,64 @@ def cmd_windows(args) -> int:
 
     windows = enumerate_windows()
     if not windows:
-        print("No titled windows found.")
+        print("No titled windows found. Is anything actually open?")
         return 1
 
     needle = (args.filter or "").lower()
-    shown = 0
-    for window in windows:
-        if needle and needle not in window.title.lower():
-            continue
-        print(window)
-        shown += 1
+    shown = [w for w in windows if not needle or needle in w.title.lower()]
+    if not shown:
+        print(f"No window title contains {args.filter!r}.")
+        return 1
 
-    print(f"\n{shown} window(s).")
-    if not args.filter:
-        print("Look for the Galaxy of Heroes client, then tell the bot its title")
-        print("by editing WINDOW_TITLE_CANDIDATES in swgoh_bot/config.py")
+    # Biggest windows first: the game is almost certainly one of the largest.
+    shown.sort(key=lambda w: w.width * w.height, reverse=True)
+
+    print(f"{'#':>3}  {'size':>11}  title")
+    print(f"{'-' * 3}  {'-' * 11}  {'-' * 50}")
+    for index, window in enumerate(shown, start=1):
+        print(f"{index:>3}  {window.width:>5}x{window.height:<5}  {window.title}")
+
+    update_settings(last_listing=[w.title for w in shown])
+
+    print()
+    print("Find the Galaxy of Heroes client above (likely one of the largest),")
+    print("then lock it in with its number, e.g.:")
+    print("    python -m swgoh_bot.cli set-window 1")
+    return 0
+
+
+def cmd_set_window(args) -> int:
+    """Remember which window is the game, by list number or by title text."""
+    target = args.window.strip()
+
+    if target.isdigit():
+        listing = load_settings().get("last_listing") or []
+        index = int(target)
+        if not listing:
+            print("No saved window listing. Run this first:")
+            print("    python -m swgoh_bot.cli windows")
+            return 1
+        if not 1 <= index <= len(listing):
+            print(f"Pick a number between 1 and {len(listing)}; got {index}.")
+            return 1
+        title = listing[index - 1]
+    else:
+        title = target
+
+    update_settings(window_title=title)
+    print(f"Saved window title: {title!r}")
+    print(f"  -> {SETTINGS_PATH}")
+
+    from swgoh_bot.window import IS_WINDOWS, WindowNotFoundError, find_game_window
+
+    if IS_WINDOWS:
+        try:
+            print(f"Found it: {find_game_window()}")
+        except WindowNotFoundError:
+            print("Warning: saved, but no window with that title is open now.")
+            return 1
+
+    print("\nNext: python -m swgoh_bot.cli grab --label home")
     return 0
 
 
@@ -255,6 +317,13 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("windows", help="list open windows to find the game client")
     p.add_argument("--filter", help="only show titles containing this text")
     p.set_defaults(func=cmd_windows)
+
+    p = sub.add_parser("set-window", help="remember which window is the game")
+    p.add_argument(
+        "window",
+        help="a number from the `windows` listing, or the window title itself",
+    )
+    p.set_defaults(func=cmd_set_window)
 
     p = sub.add_parser("grab", help="capture a screenshot")
     add_capture_options(p)
