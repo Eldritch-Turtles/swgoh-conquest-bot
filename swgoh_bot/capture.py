@@ -232,3 +232,79 @@ def create_backend(kind: str = "auto", **kwargs) -> CaptureBackend:
             return MSSBackend(**kwargs)
 
     raise ValueError(f"Unknown capture backend: {kind!r}")
+
+
+# How long to wait between frames in a burst. Long enough that an animation
+# has visibly moved, short enough that a burst is still quick.
+BURST_INTERVAL = 0.2
+
+
+def grab_burst(
+    backend: CaptureBackend, count: int = 5, interval: float = BURST_INTERVAL
+) -> list[Frame]:
+    """Capture several frames spaced apart in time.
+
+    A burst is what lets us tell static UI from animation: diff the frames and
+    whatever changed is moving. See vision.stability_mask.
+    """
+    if count < 2:
+        raise ValueError("A burst needs at least 2 frames to show movement")
+
+    frames = [backend.grab()]
+    for _ in range(count - 1):
+        time.sleep(interval)
+        frames.append(backend.grab())
+    return frames
+
+
+def frames_are_identical(frames: list[Frame], tolerance: int = 2) -> bool:
+    """True if nothing moved at all across the burst.
+
+    Usually means the burst came from a single replayed PNG rather than a live
+    game, which would make any stability analysis meaningless.
+    """
+    if len(frames) < 2:
+        return True
+    first = frames[0].image
+    return all(
+        other.image.shape == first.shape
+        and int(np.abs(other.image.astype(np.int16) - first.astype(np.int16)).max())
+        <= tolerance
+        for other in frames[1:]
+    )
+
+
+def grab_stable(
+    backend: CaptureBackend,
+    tolerance: float = 1.5,
+    max_wait: float = 8.0,
+    interval: float = 0.25,
+) -> tuple[Frame, bool]:
+    """Wait for the screen to settle, then return a frame.
+
+    Screen transitions in SWGOH slide and fade. Classifying mid-transition
+    gives a blend of two screens that matches neither, so anything that acts on
+    the current screen should settle first.
+
+    Compares successive frames by mean absolute difference and returns as soon
+    as two in a row are near-identical. Returns (frame, settled) - settled is
+    False if max_wait ran out, which is normal on a permanently animated
+    screen, and the caller can still use the frame.
+    """
+    deadline = time.time() + max_wait
+    previous = backend.grab()
+
+    while time.time() < deadline:
+        time.sleep(interval)
+        current = backend.grab()
+        if current.image.shape == previous.image.shape:
+            difference = float(
+                np.abs(
+                    current.image.astype(np.int16) - previous.image.astype(np.int16)
+                ).mean()
+            )
+            if difference <= tolerance:
+                return current, True
+        previous = current
+
+    return previous, False

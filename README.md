@@ -242,6 +242,13 @@ Aim for every row reading `ok`:
 Repeat steps 8 and 10 for each screen you captured, then tell me how it went —
 the `check` table is what I need to tune thresholds for step 2.
 
+There are around 13 screens on the path from launch to a finished battle, plus
+eight or so popups that can interrupt it. See **[docs/screens.md](docs/screens.md)**
+for the full inventory and a per-screen workflow.
+
+If a screen animates — most do — use a burst so the motion gets masked out.
+See [Animated screens](#animated-screens).
+
 ---
 
 ## Command reference
@@ -253,6 +260,8 @@ the `check` table is what I need to tune thresholds for step 2.
 | `set-window <n\|title>` | remember which window is the game |
 | `grab --label NAME` | screenshot the game into `data/captures/` |
 | `learn NAME --image FILE` | teach the bot to recognise a screen |
+| `grab --label NAME --burst 5` | capture a burst into a folder, to reveal animation |
+| `stability --image DIR` | show what moves; suggest where to crop |
 | `identify -v` | say which screen is showing, with scores |
 | `check` | grade every capture in a folder; catches leaky anchors |
 | `screens` | list the screens the bot knows |
@@ -261,6 +270,64 @@ Any command takes `--image PATH` to read a saved PNG instead of the live game,
 which is how you work on this without the game running.
 
 ---
+
+## Animated screens
+
+Most SWGOH screens move — panning backdrops, drifting scenery, breathing
+portraits, pulsing buttons. A template cropped from a moving region never
+matches twice, so plain template matching is not enough on its own.
+
+The fix is **burst capture plus masking**. Take several frames a fraction of a
+second apart, diff them, and the moving pixels identify themselves. Those
+pixels are then excluded from matching, so only the static part of an anchor —
+the text, the icon — is ever compared.
+
+```powershell
+python -m swgoh_bot.cli grab --label sector_map --burst 5
+python -m swgoh_bot.cli stability --image data\captures\sector_map-burst-<stamp>
+```
+
+`stability` reports what fraction of the screen is static, writes an overlay
+PNG with the animated parts tinted red, and suggests concrete anchor regions
+ranked by how much static detail they contain. Then:
+
+```powershell
+python -m swgoh_bot.cli learn sector_map --image data\captures\sector_map-burst-<stamp> --burst 5 --region 320,80,220,80
+```
+
+The `--burst` flag is what creates the mask.
+
+### Why this matters, measured
+
+On a test screen that is 99% animated, with antialiased title text over moving
+scenery, matching the same region with and without a mask:
+
+| | correct screen, unseen frame | wrong screen |
+|---|---|---|
+| **masked** | **0.998** | 0.065 |
+| unmasked | 0.816 — *below threshold, a false negative* | 0.492 |
+
+The unmasked anchor fails outright on a frame it has not seen. The masked one
+is confident and has a wide margin.
+
+### Where masking does not help
+
+If every pixel that survives the mask is the *same value* — solid-fill text
+over animation, say — there is nothing to correlate, and masked matching
+returns 0.0 against everything. Such an anchor never fires. This is rejected at
+save time with an explanation.
+
+Note the asymmetry, since it drives two different guards:
+
+- An **unmasked** flat template scores a perfect 1.0 against *every* screen. It
+  fails dangerously, so it is rejected if its standard deviation is under 8.
+- A **masked** template with uniform surviving pixels scores 0.0 against
+  everything. It fails safely, so it only needs to clear a much lower floor.
+  A masked anchor measured at standard deviation 6.4 still separated its screen
+  from another at 0.998 versus 0.065 — rejecting it would have been wrong.
+
+Every saved anchor is also matched against the frame it was cut from, so an
+anchor that cannot recognise its own source is refused rather than written out.
 
 ## How it works
 
@@ -299,6 +366,7 @@ folder under `data/screens/`:
 data/screens/home/
     screen.json        name, threshold, where to look for each anchor
     anchor_home.png    the cropped template
+    mask_home.png      which of those pixels to compare (if taught --burst)
     reference.png      the full screen, kept for debugging
 ```
 
@@ -314,9 +382,9 @@ otherwise the answer is `unknown`, never a guess.
 python -m pytest tests/ -q
 ```
 
-54 tests, no Windows and no game required. They cover the settings layer, the
-capture backends, the vision engine — including the cross-resolution claim
-above — and the leak detection in `check`.
+78 tests, no Windows and no game required. They cover the settings layer, the
+capture backends, the vision engine — including the cross-resolution claim and
+the animation-masking figures above — and the leak detection in `check`.
 
 ---
 
@@ -362,7 +430,10 @@ that screen.
 - [x] **Step 1 — See.** Find the window, capture frames, identify screens.
       Verified working against the real PC client (`Star Wars: Galaxy of
       Heroes`) with the `mss` backend.
+- [x] **Step 1.5 — Survive animation.** Burst capture, stability masking,
+      anchor suggestion.
 - [ ] **Step 2 — Read.** OCR for stamina numbers, feat text, energy counts.
+      Also the fallback for screens with no static anchor at all.
 - [ ] **Step 3 — Act.** Move the cursor and click. Safety first: a global
       abort hotkey and a dry-run mode before anything taps for real.
 - [ ] **Step 4 — Navigate.** A state machine that gets from launch to the

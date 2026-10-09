@@ -28,6 +28,28 @@ from swgoh_bot.config import (
 )
 
 
+def _collect_burst(args, count: int, interval: float):
+    """Gather several frames of the same screen.
+
+    From a folder of PNGs, every image in it is the burst - that's how a burst
+    captured on the Windows box gets analysed anywhere else. From the live
+    game, frames are taken `interval` seconds apart.
+    """
+    from swgoh_bot.capture import ReplayBackend, create_backend, grab_burst
+
+    if args.image and Path(args.image).is_dir():
+        backend = ReplayBackend(args.image, loop=True)
+        if len(backend.paths) < 2:
+            raise ValueError(
+                f"{args.image} holds one image; a burst needs at least 2."
+            )
+        with backend:
+            return [backend.grab() for _ in range(len(backend.paths))]
+
+    with _open_backend(args) as backend:
+        return grab_burst(backend, count=count, interval=interval)
+
+
 def _open_backend(args):
     """Build the capture backend the user asked for."""
     from swgoh_bot.capture import create_backend
@@ -168,23 +190,162 @@ def cmd_set_window(args) -> int:
 
 
 def cmd_grab(args) -> int:
-    """Capture one frame and write it to disk."""
+    """Capture a frame, or a burst of them, and write to disk."""
     import cv2
 
-    with _open_backend(args) as backend:
-        frame = backend.grab()
-
-    image = frame.to_working_size().image if args.working_size else frame.image
+    from swgoh_bot.capture import frames_are_identical, grab_burst
 
     CAPTURES_DIR.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     label = args.label or "capture"
+
+    def pixels(frame):
+        return frame.to_working_size().image if args.working_size else frame.image
+
+    if args.burst:
+        # A burst goes in its own folder, which is what `stability` and
+        # `learn --image <folder>` expect to be handed.
+        folder = (
+            Path(args.output)
+            if args.output
+            else CAPTURES_DIR / f"{label}-burst-{stamp}"
+        )
+        folder.mkdir(parents=True, exist_ok=True)
+
+        with _open_backend(args) as backend:
+            frames = grab_burst(backend, count=args.burst, interval=args.interval)
+
+        for index, frame in enumerate(frames, start=1):
+            cv2.imwrite(str(folder / f"{index:02d}.png"), pixels(frame))
+
+        print(f"captured {len(frames)} frames from {frames[0].source}")
+        print(f"saved    {folder}")
+        if frames_are_identical(frames):
+            print()
+            print("Warning: every frame is identical. Either this screen is")
+            print("completely static, or the game was not actually visible.")
+        print()
+        print("Next, see what moves:")
+        print(
+            f"    python -m swgoh_bot.cli stability --image {folder} "
+            f"--label {label}"
+        )
+        return 0
+
+    with _open_backend(args) as backend:
+        frame = backend.grab()
+
     path = Path(args.output) if args.output else CAPTURES_DIR / f"{label}-{stamp}.png"
     path.parent.mkdir(parents=True, exist_ok=True)
-
-    cv2.imwrite(str(path), image)
+    cv2.imwrite(str(path), pixels(frame))
     print(f"captured {frame.size[0]}x{frame.size[1]} from {frame.source}")
     print(f"saved    {path}")
+    return 0
+
+
+def cmd_stability(args) -> int:
+    """Find which parts of the current screen hold still.
+
+    SWGOH screens animate - drifting starfields, breathing portraits, pulsing
+    buttons. An anchor cropped from a moving region never matches twice. This
+    captures a burst, works out what moved, and proposes anchor regions that
+    are both static and distinctive.
+    """
+    import cv2
+    import numpy as np
+
+    from swgoh_bot.capture import frames_are_identical, to_working_size
+    from swgoh_bot.vision import stability_mask, suggest_anchors
+
+    try:
+        frames = _collect_burst(args, args.burst, args.interval)
+    except ValueError as exc:
+        print(f"error: {exc}")
+        return 1
+
+    print(f"{len(frames)} frames from {frames[0].source}")
+
+    if frames_are_identical(frames):
+        print()
+        print("All frames are identical - nothing moved at all.")
+        print("If this came from a single PNG, that is expected and the")
+        print("analysis below is meaningless. Capture a real burst with:")
+        print("    python -m swgoh_bot.cli grab --label home --burst 5")
+        return 1
+
+    mask = stability_mask(frames)
+    stable_pct = 100.0 * float(mask.mean()) / 255.0
+    print(f"static pixels: {stable_pct:.1f}%  (animated: {100 - stable_pct:.1f}%)")
+
+    CAPTURES_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    label = args.label or "stability"
+
+    mean_frame = np.mean(
+        np.stack([to_working_size(f.image).astype(np.float32) for f in frames]), axis=0
+    ).astype(np.uint8)
+
+    # Animated pixels tinted red over the averaged screen, so you can see at a
+    # glance which parts of the UI are safe to anchor on.
+    overlay = mean_frame.copy()
+    moving = mask == 0
+    overlay[moving] = (0.45 * overlay[moving] + 0.55 * np.array([0, 0, 255])).astype(
+        np.uint8
+    )
+
+    mask_path = CAPTURES_DIR / f"{label}-mask-{stamp}.png"
+    overlay_path = CAPTURES_DIR / f"{label}-overlay-{stamp}.png"
+    cv2.imwrite(str(mask_path), mask)
+    cv2.imwrite(str(overlay_path), overlay)
+    print(f"mask:    {mask_path}")
+    print(f"overlay: {overlay_path}   (red = animated, leave these alone)")
+
+    size = (args.width, args.height)
+
+    # Prefer a fully static region: those make the simplest anchors, needing
+    # no mask at all. Only if none exists do we look for partly static ones,
+    # which work but must be taught with a burst.
+    suggestions = suggest_anchors(frames, count=args.count, size=size)
+    needs_mask = False
+
+    if not suggestions:
+        suggestions = suggest_anchors(
+            frames, count=args.count, size=size, min_stable=0.10
+        )
+        needs_mask = True
+
+    print()
+    if not suggestions:
+        print("No region is both static and detailed enough to anchor on.")
+        print("Open the overlay and look for any non-red area with text in it.")
+        print("If essentially the whole screen moves, this screen needs OCR")
+        print("rather than template matching - tell me and I'll do that next.")
+        return 2
+
+    name = args.label or "SCREEN_NAME"
+    source = args.image or "data/captures/<your burst folder>"
+
+    if needs_mask:
+        print("No fully static region found, but these are partly static.")
+        print("Taught with --burst, the moving pixels get masked out and")
+        print("only the static ones are compared.")
+    else:
+        print(f"Best anchor regions ({len(suggestions)} found), strongest first:")
+    print()
+
+    for index, suggestion in enumerate(suggestions, start=1):
+        print(
+            f"  {index}. region {suggestion.cli_region:<20} "
+            f"static {100 * suggestion.stable_fraction:.1f}%  "
+            f"detail {suggestion.detail:.1f}"
+        )
+    print()
+    print("Teach the screen using the top suggestion:")
+    burst_flag = " --burst 5" if needs_mask else ""
+    print(
+        f"    python -m swgoh_bot.cli learn {name} --image {source}"
+        f"{burst_flag} --region {suggestions[0].cli_region}"
+    )
     return 0
 
 
@@ -235,8 +396,18 @@ def cmd_learn(args) -> int:
     from swgoh_bot.capture import to_working_size
     from swgoh_bot.vision import save_screen_definition
 
-    with _open_backend(args) as backend:
-        frame = backend.grab()
+    burst = None
+    if args.image and Path(args.image).is_dir():
+        burst = _collect_burst(args, args.burst or 5, args.interval)
+        frame = burst[0]
+        print(f"using {len(burst)} frames; animated pixels will be masked out")
+    elif args.burst:
+        burst = _collect_burst(args, args.burst, args.interval)
+        frame = burst[0]
+        print(f"captured {len(burst)} frames; animated pixels will be masked out")
+    else:
+        with _open_backend(args) as backend:
+            frame = backend.grab()
 
     region = args.region
     if region is None:
@@ -264,6 +435,7 @@ def cmd_learn(args) -> int:
             region,
             description=args.description,
             threshold=args.threshold,
+            burst=burst,
         )
     except ValueError as exc:
         print(f"error: {exc}")
@@ -441,11 +613,35 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--label", help="name to include in the saved filename")
     p.add_argument("--output", help="write to this exact path")
     p.add_argument(
+        "--burst",
+        type=int,
+        metavar="N",
+        help="capture N frames into a folder, to reveal what animates",
+    )
+    p.add_argument(
+        "--interval",
+        type=float,
+        default=0.2,
+        help="seconds between burst frames (default: 0.2)",
+    )
+    p.add_argument(
         "--working-size",
         action="store_true",
         help=f"save at {WORK_WIDTH}x{WORK_HEIGHT} instead of native resolution",
     )
     p.set_defaults(func=cmd_grab)
+
+    p = sub.add_parser(
+        "stability", help="find which parts of a screen hold still"
+    )
+    add_capture_options(p)
+    p.add_argument("--label", help="screen name, used for output filenames")
+    p.add_argument("--burst", type=int, default=5, help="frames to compare")
+    p.add_argument("--interval", type=float, default=0.2, help="seconds between frames")
+    p.add_argument("--count", type=int, default=5, help="how many regions to suggest")
+    p.add_argument("--width", type=int, default=220, help="suggested region width")
+    p.add_argument("--height", type=int, default=80, help="suggested region height")
+    p.set_defaults(func=cmd_stability)
 
     p = sub.add_parser("identify", help="say which screen is showing")
     add_capture_options(p)
@@ -463,6 +659,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--description", default="", help="human note about this screen")
     p.add_argument("--threshold", type=float, default=0.85, help="match threshold")
+    p.add_argument(
+        "--burst",
+        type=int,
+        metavar="N",
+        help="compare N frames and mask out whatever animates",
+    )
+    p.add_argument(
+        "--interval", type=float, default=0.2, help="seconds between burst frames"
+    )
     p.set_defaults(func=cmd_learn)
 
     p = sub.add_parser(
